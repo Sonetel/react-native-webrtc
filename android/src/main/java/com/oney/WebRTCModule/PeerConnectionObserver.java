@@ -1,23 +1,15 @@
 package com.oney.WebRTCModule;
 
-import java.io.UnsupportedEncodingException;
-import java.lang.ref.SoftReference;
-import java.nio.ByteBuffer;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.Iterator;
-import java.util.List;
-import java.util.Map;
-import java.util.UUID;
-
-import android.support.annotation.Nullable;
 import android.util.Base64;
 import android.util.Log;
 import android.util.SparseArray;
 
+import androidx.annotation.Nullable;
+
 import com.facebook.react.bridge.Arguments;
-import com.facebook.react.bridge.Callback;
+import com.facebook.react.bridge.Promise;
 import com.facebook.react.bridge.ReadableMap;
+import com.facebook.react.bridge.ReadableArray;
 import com.facebook.react.bridge.WritableArray;
 import com.facebook.react.bridge.WritableMap;
 
@@ -27,77 +19,48 @@ import org.webrtc.IceCandidate;
 import org.webrtc.MediaStream;
 import org.webrtc.MediaStreamTrack;
 import org.webrtc.PeerConnection;
+import org.webrtc.RTCStats;
+import org.webrtc.RTCStatsReport;
 import org.webrtc.RtpReceiver;
-import org.webrtc.StatsObserver;
-import org.webrtc.StatsReport;
+import org.webrtc.RtpSender;
+import org.webrtc.RtpTransceiver;
+import org.webrtc.SessionDescription;
 import org.webrtc.VideoTrack;
+
+import java.io.UnsupportedEncodingException;
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+import java.util.UUID;
 
 class PeerConnectionObserver implements PeerConnection.Observer {
     private final static String TAG = WebRTCModule.TAG;
 
-    private final SparseArray<DataChannel> dataChannels
-        = new SparseArray<DataChannel>();
+    private final Map<String, DataChannelWrapper> dataChannels;
     private final int id;
+    private int transceiverNextId = 0;
+
     private PeerConnection peerConnection;
-    final List<MediaStream> localStreams;
     final Map<String, MediaStream> remoteStreams;
     final Map<String, MediaStreamTrack> remoteTracks;
     private final VideoTrackAdapter videoTrackAdapters;
     private final WebRTCModule webRTCModule;
 
-    /**
-     * The <tt>StringBuilder</tt> cache utilized by {@link #statsToJSON} in
-     * order to minimize the number of allocations of <tt>StringBuilder</tt>
-     * instances and, more importantly, the allocations of its <tt>char</tt>
-     * buffer in an attempt to improve performance.
-     */
-    private SoftReference<StringBuilder> statsToJSONStringBuilder
-        = new SoftReference<>(null);
-
     PeerConnectionObserver(WebRTCModule webRTCModule, int id) {
         this.webRTCModule = webRTCModule;
         this.id = id;
-        this.localStreams = new ArrayList<MediaStream>();
-        this.remoteStreams = new HashMap<String, MediaStream>();
-        this.remoteTracks = new HashMap<String, MediaStreamTrack>();
+        this.dataChannels = new HashMap<>();
+        this.remoteStreams = new HashMap<>();
+        this.remoteTracks = new HashMap<>();
         this.videoTrackAdapters = new VideoTrackAdapter(webRTCModule, id);
-    }
-
-    /**
-     * Adds a specific local <tt>MediaStream</tt> to the associated
-     * <tt>PeerConnection</tt>.
-     *
-     * @param localStream the local <tt>MediaStream</tt> to add to the
-     * associated <tt>PeerConnection</tt>
-     * @return <tt>true</tt> if the specified <tt>localStream</tt> was added to
-     * the associated <tt>PeerConnection</tt>; otherwise, <tt>false</tt>
-     */
-    boolean addStream(MediaStream localStream) {
-        if (peerConnection != null && peerConnection.addStream(localStream)) {
-            localStreams.add(localStream);
-
-            return true;
-        }
-
-        return false;
-    }
-
-    /**
-     * Removes a specific local <tt>MediaStream</tt> from the associated
-     * <tt>PeerConnection</tt>.
-     *
-     * @param localStream the local <tt>MediaStream</tt> from the associated
-     * <tt>PeerConnection</tt>
-     * @return <tt>true</tt> if removing the specified <tt>mediaStream</tt> from
-     * this instance resulted in a modification of its internal list of local
-     * <tt>MediaStream</tt>s; otherwise, <tt>false</tt>
-     */
-    boolean removeStream(MediaStream localStream) {
-        if (peerConnection != null) {
-            peerConnection.removeStream(localStream);
-        }
-
-        return localStreams.remove(localStream);
     }
 
     PeerConnection getPeerConnection() {
@@ -109,23 +72,23 @@ class PeerConnectionObserver implements PeerConnection.Observer {
     }
 
     void close() {
+        Log.d(TAG, "PeerConnection.close() for " + id);
+
         // Close the PeerConnection first to stop any events.
         peerConnection.close();
 
-        // PeerConnection.dispose() calls MediaStream.dispose() on all local
-        // MediaStreams added to it and the app may crash if a local MediaStream
-        // is added to multiple PeerConnections. In order to reduce the risks of
-        // an app crash, remove all local MediaStreams from the associated
-        // PeerConnection so that it doesn't attempt to dispose of them.
-        for (MediaStream localStream : new ArrayList<>(localStreams)) {
-            removeStream(localStream);
-        }
-
         // Remove video track adapters
-        for (MediaStreamTrack track : remoteTracks.values()) {
-            if (track.kind().equals("video")) {
+        for (MediaStreamTrack track : this.remoteTracks.values()) {
+            if (track instanceof VideoTrack) {
                 videoTrackAdapters.removeAdapter((VideoTrack) track);
             }
+        }
+
+        // Remove DataChannel observers
+        for (DataChannelWrapper dcw : dataChannels.values()) {
+            DataChannel dataChannel = dcw.getDataChannel();
+            dataChannel.close();
+            dataChannel.unregisterObserver();
         }
 
         // At this point there should be no local MediaStreams in the associated
@@ -135,13 +98,58 @@ class PeerConnectionObserver implements PeerConnection.Observer {
 
         remoteStreams.clear();
         remoteTracks.clear();
-
-        // Unlike on iOS, we cannot unregister the DataChannel.Observer
-        // instance on Android. At least do whatever else we do on iOS.
         dataChannels.clear();
     }
 
-    void createDataChannel(String label, ReadableMap config) {
+
+    public synchronized int getNextTransceiverId() {
+        return transceiverNextId++;
+    }
+
+    RtpTransceiver addTransceiver(MediaStreamTrack.MediaType mediaType, RtpTransceiver.RtpTransceiverInit init) {
+        if (peerConnection == null) {
+            return null;
+        }
+
+        return peerConnection.addTransceiver(mediaType, init);
+    }
+
+    RtpTransceiver addTransceiver(MediaStreamTrack track, RtpTransceiver.RtpTransceiverInit init) {
+        if (peerConnection == null) {
+            return null;
+        }
+
+        return peerConnection.addTransceiver(track, init);
+    }
+
+    RtpSender getSender(String id) {
+        if (this.peerConnection == null) {
+            return null;
+        }
+
+        for (RtpSender sender: this.peerConnection.getSenders()) {
+            if (sender.id().equals(id)) {
+                return sender;
+            }
+        }
+
+        return null;
+    }
+
+    RtpTransceiver getTransceiver(String id) {
+        if (this.peerConnection == null) {
+            return null;
+        }
+
+        for (RtpTransceiver transceiver: this.peerConnection.getTransceivers()) {
+            if (transceiver.getSender().id().equals(id)) {
+                return transceiver;
+            }
+        }
+        return null;
+    }
+
+    WritableMap createDataChannel(String label, ReadableMap config) {
         DataChannel.Init init = new DataChannel.Init();
         if (config != null) {
             if (config.hasKey("id")) {
@@ -164,136 +172,236 @@ class PeerConnectionObserver implements PeerConnection.Observer {
             }
         }
         DataChannel dataChannel = peerConnection.createDataChannel(label, init);
-        int dataChannelId = init.id;
-        if (-1 != dataChannelId) {
-            dataChannels.put(dataChannelId, dataChannel);
-            registerDataChannelObserver(dataChannelId, dataChannel);
+        if (dataChannel == null) {
+            return null;
         }
+        final String reactTag  = UUID.randomUUID().toString();
+        DataChannelWrapper dcw = new DataChannelWrapper(webRTCModule, id, reactTag, dataChannel);
+        dataChannels.put(reactTag, dcw);
+        dataChannel.registerObserver(dcw);
+
+        WritableMap info = Arguments.createMap();
+        info.putInt("peerConnectionId", id);
+        info.putString("reactTag", reactTag);
+        info.putString("label", dataChannel.label());
+        info.putInt("id", dataChannel.id());
+        info.putBoolean("ordered", init.ordered);
+        info.putInt("maxPacketLifeTime", init.maxRetransmitTimeMs);
+        info.putInt("maxRetransmits", init.maxRetransmits);
+        info.putString("protocol", init.protocol);
+        info.putBoolean("negotiated", init.negotiated);
+        info.putString("readyState", dcw.dataChannelStateString(dataChannel.state()));
+        return info;
     }
 
-    void dataChannelClose(int dataChannelId) {
-        DataChannel dataChannel = dataChannels.get(dataChannelId);
-        if (dataChannel != null) {
-            dataChannel.close();
-            dataChannels.remove(dataChannelId);
-        } else {
+    void dataChannelClose(String reactTag) {
+        DataChannelWrapper dcw = dataChannels.get(reactTag);
+        if (dcw == null) {
             Log.d(TAG, "dataChannelClose() dataChannel is null");
+            return;
         }
+
+        DataChannel dataChannel = dcw.getDataChannel();
+        dataChannel.close();
     }
 
-    void dataChannelSend(int dataChannelId, String data, String type) {
-        DataChannel dataChannel = dataChannels.get(dataChannelId);
-        if (dataChannel != null) {
-            byte[] byteArray;
-            if (type.equals("text")) {
-                try {
-                    byteArray = data.getBytes("UTF-8");
-                } catch (UnsupportedEncodingException e) {
-                    Log.d(TAG, "Could not encode text string as UTF-8.");
-                    return;
-                }
-            } else if (type.equals("binary")) {
-                byteArray = Base64.decode(data, Base64.NO_WRAP);
-            } else {
-                Log.e(TAG, "Unsupported data type: " + type);
-                return;
-            }
-            ByteBuffer byteBuffer = ByteBuffer.wrap(byteArray);
-            DataChannel.Buffer buffer = new DataChannel.Buffer(byteBuffer, type.equals("binary"));
-            dataChannel.send(buffer);
-        } else {
+    void dataChannelDispose(String reactTag) {
+        DataChannelWrapper dcw = dataChannels.get(reactTag);
+        if (dcw == null) {
+            Log.d(TAG, "dataChannelDispose() dataChannel is null");
+            return;
+        }
+
+        DataChannel dataChannel = dcw.getDataChannel();
+        dataChannel.unregisterObserver();
+        dataChannels.remove(reactTag);
+    }
+
+    void dataChannelSend(String reactTag, String data, String type) {
+        DataChannelWrapper dcw = dataChannels.get(reactTag);
+        if (dcw == null) {
             Log.d(TAG, "dataChannelSend() dataChannel is null");
+            return;
         }
+
+        byte[] byteArray;
+        if (type.equals("text")) {
+            byteArray = data.getBytes(StandardCharsets.UTF_8);
+        } else if (type.equals("binary")) {
+            byteArray = Base64.decode(data, Base64.NO_WRAP);
+        } else {
+            Log.e(TAG, "Unsupported data type: " + type);
+            return;
+        }
+        ByteBuffer byteBuffer = ByteBuffer.wrap(byteArray);
+        DataChannel.Buffer buffer = new DataChannel.Buffer(byteBuffer, type.equals("binary"));
+        dcw.getDataChannel().send(buffer);
     }
 
-    void getStats(String trackId, final Callback cb) {
-        MediaStreamTrack track = null;
-        if (trackId == null
-                || trackId.isEmpty()
-                || (track = webRTCModule.getLocalTrack(trackId)) != null
-                || (track = remoteTracks.get(trackId)) != null) {
-            peerConnection.getStats(
-                    new StatsObserver() {
-                        @Override
-                        public void onComplete(StatsReport[] reports) {
-                            cb.invoke(true, statsToJSON(reports));
-                        }
-                    },
-                    track);
-        } else {
-            Log.e(TAG, "peerConnectionGetStats() MediaStreamTrack not found for id: " + trackId);
-            cb.invoke(false, "Track not found");
-        }
+    void getStats(Promise promise) {
+        peerConnection.getStats(rtcStatsReport -> {
+            promise.resolve(StringUtils.statsToJSON(rtcStatsReport));
+        });
     }
+
 
     /**
-     * Constructs a JSON <tt>String</tt> representation of a specific array of
-     * <tt>StatsReport</tt>s (produced by {@link PeerConnection#getStats}).
-     * <p>
-     * On Android it is faster to (1) construct a single JSON <tt>String</tt>
-     * representation of an array of <tt>StatsReport</tt>s and (2) have it pass
-     * through the React Native bridge rather than the array of
-     * <tt>StatsReport</tt>s.
-     *
-     * @param reports the array of <tt>StatsReport</tt>s to represent in JSON
-     * format
-     * @return a <tt>String</tt> which represents the specified <tt>reports</tt>
-     * in JSON format
+     * @param trackIdentifier sender or receiver id
+     * @param streamType "outbound-rtp" for sender or "inbound-rtp" for receiver
      */
-    private String statsToJSON(StatsReport[] reports) {
-        // If possible, reuse a single StringBuilder instance across multiple
-        // getStats method calls in order to reduce the total number of
-        // allocations.
-        StringBuilder s = statsToJSONStringBuilder.get();
-        if (s == null) {
-            s = new StringBuilder();
-            statsToJSONStringBuilder = new SoftReference(s);
-        }
-
-        s.append('[');
-        final int reportCount = reports.length;
-        for (int i = 0; i < reportCount; ++i) {
-            StatsReport report = reports[i];
-            if (i != 0) {
-                s.append(',');
+    void getFilteredStats(String trackIdentifier, boolean isReceiver, Promise promise) {
+        
+        peerConnection.getStats(rtcStatsReport -> {
+            Map<String, RTCStats> statsMap = rtcStatsReport.getStatsMap();
+            Set<RTCStats> filteredStats = new HashSet<>();
+            // Get track stats
+            RTCStats trackStats = getTrackStats(trackIdentifier, statsMap);
+            if (trackStats == null) {
+                Log.w(TAG, "getStats: couldn't find track stats!");
+                RTCStatsReport report = new RTCStatsReport((long) rtcStatsReport.getTimestampUs(), new HashMap<>());
+                promise.resolve(StringUtils.statsToJSON(report));
+                return;
             }
-            s.append("{\"id\":\"").append(report.id)
-                .append("\",\"type\":\"").append(report.type)
-                .append("\",\"timestamp\":").append(report.timestamp)
-                .append(",\"values\":[");
-            StatsReport.Value[] values = report.values;
-            final int valueCount = values.length;
-            for (int j = 0; j < valueCount; ++j) {
-                StatsReport.Value v = values[j];
-                if (j != 0) {
-                    s.append(',');
+
+            filteredStats.add(trackStats);
+            String trackId = trackStats.getId();
+
+            // Get stream stats
+            RTCStats streamStats = getStreamStats(trackId, statsMap);
+            if (streamStats != null) {
+                filteredStats.add(streamStats);
+            }
+
+            // Get streamType stats and associated information
+            Set<Long> ssrcs = new HashSet<>();
+            Set<String> codecIds = new HashSet<>();
+
+            String streamType;
+            if (isReceiver) {
+                streamType = "inbound-rtp";
+            } else {
+                streamType = "outbound-rtp";
+            }
+
+            for (RTCStats stats : statsMap.values()) {
+                if (stats.getType().equals(streamType) && trackId.equals(stats.getMembers().get("trackId"))) {
+                    ssrcs.add((Long) stats.getMembers().get("ssrc"));
+                    codecIds.add((String) stats.getMembers().get("codecId"));
+                    filteredStats.add(stats);
                 }
-                s.append("{\"").append(v.name).append("\":\"").append(v.value)
-                    .append("\"}");
             }
-            s.append("]}");
+
+
+            // Get candidate information
+            RTCStats candidatePairStats = null;
+            for (RTCStats stats : statsMap.values()) {
+                if (stats.getType().equals("candidate-pair") && stats.getMembers().get("nominated").equals(true)) {
+                    candidatePairStats = stats;
+                    break;
+                }
+            }
+
+            String localCandidateId = null;
+            String remoteCandidateId = null;
+            if (candidatePairStats != null) {
+                filteredStats.add(candidatePairStats);
+                localCandidateId = (String) candidatePairStats.getMembers().get("localCandidateId");
+                remoteCandidateId = (String) candidatePairStats.getMembers().get("remoteCandidateId");
+            }
+
+            // Sweep for any remaining stats we want.
+            filteredStats.addAll(getExtraStats(trackIdentifier, ssrcs, codecIds, localCandidateId, remoteCandidateId, statsMap));
+
+            Map<String, RTCStats> filteredStatsMap = new HashMap<>();
+            for (RTCStats stats : filteredStats) {
+                filteredStatsMap.put(stats.getId(), stats);
+            }
+            RTCStatsReport filteredStatsReport = new RTCStatsReport((long) rtcStatsReport.getTimestampUs(), filteredStatsMap);
+            promise.resolve(StringUtils.statsToJSON(filteredStatsReport));
+        });
+    }
+
+    // Note: trackIdentifier can differ from the internal stats trackId
+    // trackIdentifier refers to the sender or receiver id
+    @Nullable
+    private RTCStats getTrackStats(String trackIdentifier, Map<String, RTCStats> statsMap) {
+        for (RTCStats stats : statsMap.values()) {
+            if (stats.getType().equals("track") && trackIdentifier.equals(stats.getMembers().get("trackIdentifier"))) {
+                return stats;
+            }
         }
-        s.append("]");
+        return null;
+    }
 
-        String r = s.toString();
-        // Prepare the StringBuilder instance for reuse (in order to reduce the
-        // total number of allocations performed during multiple getStats method
-        // calls).
-        s.setLength(0);
 
-        return r;
+    @Nullable
+    private RTCStats getStreamStats(String trackId, Map<String, RTCStats> statsMap) {
+        for (RTCStats stats : statsMap.values()) {
+            if (stats.getType().equals("stream")
+                    && Arrays.asList((String[]) stats.getMembers().get("trackIds")).contains(trackId)) {
+                return stats;
+            }
+        }
+        return null;
+    }
+
+    // Note: trackIdentifier can differ from the internal stats trackId
+    // trackIdentifier refers to the sender or receiver id
+    public Set<RTCStats> getExtraStats(
+            String trackIdentifier,
+            Set<Long> ssrcs,
+            Set<String> codecIds,
+            @Nullable String localCandidateId,
+            @Nullable String remoteCandidateId,
+            Map<String, RTCStats> statsMap) {
+        Set<RTCStats> extraStats = new HashSet<>();
+        for (RTCStats stats : statsMap.values()) {
+            switch (stats.getType()) {
+                case "certificate":
+                case "transport":
+                    extraStats.add(stats);
+                    break;
+            }
+
+            if (stats.getId().equals(localCandidateId) || stats.getId().equals(remoteCandidateId)) {
+                extraStats.add(stats);
+                continue;
+            }
+
+            if (ssrcs.contains(stats.getMembers().get("ssrc"))) {
+                extraStats.add(stats);
+                continue;
+            }
+            if (trackIdentifier.equals(stats.getMembers().get("trackIdentifier"))) {
+                extraStats.add(stats);
+                continue;
+            }
+            if (codecIds.contains(stats.getId())) {
+                extraStats.add(stats);
+            }
+        }
+
+        return extraStats;
     }
 
     @Override
     public void onIceCandidate(final IceCandidate candidate) {
         Log.d(TAG, "onIceCandidate");
         WritableMap params = Arguments.createMap();
-        params.putInt("id", id);
+        params.putInt("pcId", id);
         WritableMap candidateParams = Arguments.createMap();
         candidateParams.putInt("sdpMLineIndex", candidate.sdpMLineIndex);
         candidateParams.putString("sdpMid", candidate.sdpMid);
         candidateParams.putString("candidate", candidate.sdp);
         params.putMap("candidate", candidateParams);
+        SessionDescription newSdp = peerConnection.getLocalDescription();
+        WritableMap newSdpMap = Arguments.createMap();
+        // Can happen when doing a rollback.
+        if (newSdp != null) {
+            newSdpMap.putString("type", newSdp.type.canonicalForm());
+            newSdpMap.putString("sdp", newSdp.description);
+        }
+        params.putMap("sdp", newSdpMap);
 
         webRTCModule.sendEvent("peerConnectionGotICECandidate", params);
     }
@@ -306,10 +414,18 @@ class PeerConnectionObserver implements PeerConnection.Observer {
     @Override
     public void onIceConnectionChange(PeerConnection.IceConnectionState iceConnectionState) {
         WritableMap params = Arguments.createMap();
-        params.putInt("id", id);
+        params.putInt("pcId", id);
         params.putString("iceConnectionState", iceConnectionStateString(iceConnectionState));
-
         webRTCModule.sendEvent("peerConnectionIceConnectionChanged", params);
+    }
+
+    @Override
+    public void onConnectionChange(PeerConnection.PeerConnectionState peerConnectionState) {
+        WritableMap params = Arguments.createMap();
+        params.putInt("pcId", id);
+        params.putString("connectionState", peerConnectionStateString(peerConnectionState));
+
+        webRTCModule.sendEvent("peerConnectionStateChanged", params);
     }
 
     @Override
@@ -320,161 +436,182 @@ class PeerConnectionObserver implements PeerConnection.Observer {
     public void onIceGatheringChange(PeerConnection.IceGatheringState iceGatheringState) {
         Log.d(TAG, "onIceGatheringChange" + iceGatheringState.name());
         WritableMap params = Arguments.createMap();
-        params.putInt("id", id);
+        params.putInt("pcId", id);
         params.putString("iceGatheringState", iceGatheringStateString(iceGatheringState));
+        if (iceGatheringState == PeerConnection.IceGatheringState.COMPLETE) {
+            SessionDescription newSdp = peerConnection.getLocalDescription();
+            WritableMap newSdpMap = Arguments.createMap();
+            // Can happen when doing a rollback.
+            if (newSdp != null) {
+                newSdpMap.putString("type", newSdp.type.canonicalForm());
+                newSdpMap.putString("sdp", newSdp.description);
+            }
+            params.putMap("sdp", newSdpMap);
+        }
         webRTCModule.sendEvent("peerConnectionIceGatheringChanged", params);
-    }
-
-    private String getReactTagForStream(MediaStream mediaStream) {
-        for (Iterator<Map.Entry<String, MediaStream>> i
-                    = remoteStreams.entrySet().iterator();
-                i.hasNext();) {
-            Map.Entry<String, MediaStream> e = i.next();
-            if (e.getValue().equals(mediaStream)) {
-                return e.getKey();
-            }
-        }
-        return null;
-    }
-
-    @Override
-    public void onAddStream(MediaStream mediaStream) {
-        String streamReactTag = null;
-        String streamId = mediaStream.getId();
-        // The native WebRTC implementation has a special concept of a default
-        // MediaStream instance with the label default that the implementation
-        // reuses.
-        if ("default".equals(streamId)) {
-            for (Map.Entry<String, MediaStream> e
-                    : remoteStreams.entrySet()) {
-                if (e.getValue().equals(mediaStream)) {
-                    streamReactTag = e.getKey();
-                    break;
-                }
-            }
-        }
-
-        if (streamReactTag == null) {
-            streamReactTag = UUID.randomUUID().toString();
-            remoteStreams.put(streamReactTag, mediaStream);
-        }
-
-        WritableMap params = Arguments.createMap();
-        params.putInt("id", id);
-        params.putString("streamId", streamId);
-        params.putString("streamReactTag", streamReactTag);
-
-        WritableArray tracks = Arguments.createArray();
-
-        for (int i = 0; i < mediaStream.videoTracks.size(); i++) {
-            VideoTrack track = mediaStream.videoTracks.get(i);
-            String trackId = track.id();
-
-            remoteTracks.put(trackId, track);
-
-            WritableMap trackInfo = Arguments.createMap();
-            trackInfo.putString("id", trackId);
-            trackInfo.putString("label", "Video");
-            trackInfo.putString("kind", track.kind());
-            trackInfo.putBoolean("enabled", track.enabled());
-            trackInfo.putString("readyState", track.state().toString());
-            trackInfo.putBoolean("remote", true);
-            tracks.pushMap(trackInfo);
-
-            videoTrackAdapters.addAdapter(streamReactTag, track);
-        }
-        for (int i = 0; i < mediaStream.audioTracks.size(); i++) {
-            AudioTrack track = mediaStream.audioTracks.get(i);
-            String trackId = track.id();
-
-            remoteTracks.put(trackId, track);
-
-            WritableMap trackInfo = Arguments.createMap();
-            trackInfo.putString("id", trackId);
-            trackInfo.putString("label", "Audio");
-            trackInfo.putString("kind", track.kind());
-            trackInfo.putBoolean("enabled", track.enabled());
-            trackInfo.putString("readyState", track.state().toString());
-            trackInfo.putBoolean("remote", true);
-            tracks.pushMap(trackInfo);
-        }
-        params.putArray("tracks", tracks);
-
-        webRTCModule.sendEvent("peerConnectionAddedStream", params);
-    }
-
-    @Override
-    public void onRemoveStream(MediaStream mediaStream) {
-        String streamReactTag = getReactTagForStream(mediaStream);
-        if (streamReactTag == null) {
-            Log.w(TAG,
-                "onRemoveStream - no remote stream for id: "
-                    + mediaStream.getId());
-            return;
-        }
-
-        for (VideoTrack track : mediaStream.videoTracks) {
-            this.videoTrackAdapters.removeAdapter(track);
-            this.remoteTracks.remove(track.id());
-        }
-        for (AudioTrack track : mediaStream.audioTracks) {
-            this.remoteTracks.remove(track.id());
-        }
-
-        this.remoteStreams.remove(streamReactTag);
-
-        WritableMap params = Arguments.createMap();
-        params.putInt("id", id);
-        params.putString("streamId", streamReactTag);
-        webRTCModule.sendEvent("peerConnectionRemovedStream", params);
     }
 
     @Override
     public void onDataChannel(DataChannel dataChannel) {
-        final int dataChannelId = dataChannel.id();
-        if (-1 == dataChannelId) {
-          return;
-        }
+        final String reactTag  = UUID.randomUUID().toString();
+        DataChannelWrapper dcw = new DataChannelWrapper(webRTCModule, id, reactTag, dataChannel);
+        dataChannels.put(reactTag, dcw);
+        dataChannel.registerObserver(dcw);
 
-        WritableMap dataChannelParams = Arguments.createMap();
-        dataChannelParams.putInt("id", dataChannelId);
-        dataChannelParams.putString("label", dataChannel.label());
+        WritableMap info = Arguments.createMap();
+        info.putInt("peerConnectionId", id);
+        info.putString("reactTag", reactTag);
+        info.putString("label", dataChannel.label());
+        info.putInt("id", dataChannel.id());
+
+        // TODO: These values are not gettable from a DataChannel instance.
+        info.putBoolean("ordered", true);
+        info.putInt("maxPacketLifeTime", -1);
+        info.putInt("maxRetransmits", -1);
+        info.putString("protocol", "");
+
+        info.putBoolean("negotiated", false);
+        info.putString("readyState", dcw.dataChannelStateString(dataChannel.state()));
+
         WritableMap params = Arguments.createMap();
-        params.putInt("id", id);
-        params.putMap("dataChannel", dataChannelParams);
-
-        dataChannels.put(dataChannelId, dataChannel);
-        registerDataChannelObserver(dataChannelId, dataChannel);
+        params.putInt("pcId", id);
+        params.putMap("dataChannel", info);
 
         webRTCModule.sendEvent("peerConnectionDidOpenDataChannel", params);
-    }
-
-    private void registerDataChannelObserver(int dcId, DataChannel dataChannel) {
-        // DataChannel.registerObserver implementation does not allow to
-        // unregister, so the observer is registered here and is never
-        // unregistered
-        dataChannel.registerObserver(
-            new DataChannelObserver(webRTCModule, id, dcId, dataChannel));
     }
 
     @Override
     public void onRenegotiationNeeded() {
         WritableMap params = Arguments.createMap();
-        params.putInt("id", id);
+        params.putInt("pcId", id);
         webRTCModule.sendEvent("peerConnectionOnRenegotiationNeeded", params);
     }
 
     @Override
     public void onSignalingChange(PeerConnection.SignalingState signalingState) {
         WritableMap params = Arguments.createMap();
-        params.putInt("id", id);
+        params.putInt("pcId", id);
         params.putString("signalingState", signalingStateString(signalingState));
         webRTCModule.sendEvent("peerConnectionSignalingStateChanged", params);
     }
 
+    /**
+     * Triggered when a new track is signaled by the remote peer, as a result of
+     * setRemoteDescription.
+     */
     @Override
     public void onAddTrack(final RtpReceiver receiver, final MediaStream[] mediaStreams) {
         Log.d(TAG, "onAddTrack");
+
+        ThreadUtils.runOnExecutor(() -> {
+            RtpTransceiver transceiver = null;
+            for(RtpTransceiver t: this.peerConnection.getTransceivers()) {
+                if (Objects.equals(t.getReceiver().id(), receiver.id())) {
+                    transceiver = t;
+                    break;
+                }
+            }
+
+            if (transceiver == null) {
+                return;
+            }
+
+            final MediaStreamTrack track = receiver.track();
+
+            // We need to fire this event for an existing track sometimes, like
+            // when the transceiver direction (on the sending side) switches from
+            // sendrecv to recvonly and then back.
+            final boolean existingTrack = remoteTracks.containsKey(track.id());
+
+            if (!existingTrack) {
+                if (track.kind().equals(MediaStreamTrack.VIDEO_TRACK_KIND)){
+                    videoTrackAdapters.addAdapter((VideoTrack) track);
+                }
+                remoteTracks.put(track.id(), track);
+            }
+
+            WritableMap params = Arguments.createMap();
+            WritableArray streams = Arguments.createArray();
+
+            for (MediaStream stream : mediaStreams) {
+                // Getting the streamReactTag
+                String streamReactTag = null;
+                for (Map.Entry<String, MediaStream> e : remoteStreams.entrySet()) {
+                    if (e.getValue().equals(stream)) {
+                        streamReactTag = e.getKey();
+                        break;
+                    }
+                }
+                if (streamReactTag == null) {
+                    streamReactTag = UUID.randomUUID().toString();
+                    remoteStreams.put(streamReactTag, stream);
+                }
+                streams.pushMap(SerializeUtils.serializeStream(id, streamReactTag, stream));
+            }
+
+            params.putArray("streams", streams);
+            params.putMap("receiver", SerializeUtils.serializeReceiver(id, receiver));
+            params.putInt("transceiverOrder", getNextTransceiverId());
+            params.putMap("transceiver", SerializeUtils.serializeTransceiver(id, transceiver));
+            params.putInt("pcId", this.id);
+
+            webRTCModule.sendEvent("peerConnectionOnTrack", params);
+        });
+    }
+
+    /**
+     * Triggered when the signaling from SetRemoteDescription indicates that a transceiver
+     * will be receiving media from a remote endpoint. This is only called if UNIFIED_PLAN
+     * semantics are specified. The transceiver will be disposed automatically.
+     */
+    @Override
+    public void onTrack(final RtpTransceiver transceiver) {
+    }
+
+    /*
+     * Triggered when a previously added remote track is removed by the remote
+     * peer, as a result of setRemoteDescription.
+     */
+    @Override
+    public void onRemoveTrack(RtpReceiver receiver){
+        ThreadUtils.runOnExecutor(() -> {
+            WritableMap params = Arguments.createMap();
+            params.putInt("pcId", this.id);
+            params.putString("receiverId", receiver.id());
+
+            webRTCModule.sendEvent("peerConnectionOnRemoveTrack", params);
+        });
+    };
+
+    // This is only added to compile. Plan B is not supported anymore.
+    @Override
+    public void onRemoveStream(MediaStream stream) {
+
+    }
+
+    // This is only added to compile. Plan B is not supported anymore.
+    @Override
+    public void onAddStream(MediaStream stream) {
+
+    }
+
+    @Nullable
+    private String peerConnectionStateString(PeerConnection.PeerConnectionState peerConnectionState) {
+        switch (peerConnectionState) {
+            case NEW:
+                return "new";
+            case CONNECTING:
+                return "connecting";
+            case CONNECTED:
+                return "connected";
+            case DISCONNECTED:
+                return "disconnected";
+            case FAILED:
+                return "failed";
+            case CLOSED:
+                return "closed";
+        }
+        return null;
     }
 
     @Nullable
@@ -529,4 +666,5 @@ class PeerConnectionObserver implements PeerConnection.Observer {
         }
         return null;
     }
+
 }

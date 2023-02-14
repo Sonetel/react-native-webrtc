@@ -1,102 +1,137 @@
+# Android Installation
 
+Starting with React Native 0.60 due to a new auto linking feature you no longer need to follow manual linking steps but you will need to follow the other steps below if you plan on releasing your app to production.  
 
-1.) In `android/app/src/main/AndroidManifest.xml` add these permissions
+See a sample app in the `examples/GumTestApp` directory.  
+
+## Declaring Permissions
+
+In `android/app/src/main/AndroidManifest.xml` add the following permissions before the `<application>` section.  
 
 ```xml
-<uses-permission android:name="android.permission.CAMERA" />
 <uses-feature android:name="android.hardware.camera" />
-<uses-feature android:name="android.hardware.camera.autofocus"/>
+<uses-feature android:name="android.hardware.camera.autofocus" />
+<uses-feature android:name="android.hardware.audio.output" />
+<uses-feature android:name="android.hardware.microphone" />
 
-<uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
-<uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+<uses-permission android:name="android.permission.CAMERA" />
 <uses-permission android:name="android.permission.RECORD_AUDIO" />
-<uses-permission android:name="android.permission.WAKE_LOCK" />
-<uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"/>
+<uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+<uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
+<uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+<uses-permission android:name="android.permission.INTERNET" />
 ```
 
-2.) In `android/settings.gradle`, includes WebRTCModule
-```gradle
-include ':WebRTCModule', ':app'
-project(':WebRTCModule').projectDir = new File(rootProject.projectDir, '../node_modules/react-native-webrtc/android')
+If you plan to also support Bluetooth devices then also add the following.
+
+```xml
+<uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
+<uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
+<uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
 ```
 
-3.) In `android/app/build.gradle`, add WebRTCModule to dependencies
-```gradle
-dependencies {
-  ...
-  compile project(':WebRTCModule')
-}
+## Enable Java 8 Support
 
-```
+In `android/app/build.gradle` add the following inside the `android` section.
 
-4.) In `android/app/src/main/java/com/xxx/MainApplication.java`
-
-After 0.19.0
-```java
-import com.oney.WebRTCModule.WebRTCModulePackage;  // <--- Add this line
-...
-    @Override
-    protected List<ReactPackage> getPackages() {
-      return Arrays.<ReactPackage>asList(
-        new MainReactPackage(),
-        new WebRTCModulePackage()                  // <--- Add this line
-      );
-    }
-```
-Before 0.18.0
-```java
-import com.oney.WebRTCModule.WebRTCModulePackage;  // <--- Add this line
-...
-
- public class MainActivity extends Activity implements DefaultHardwareBackBtnHandler {
- ...
-
-     .addPackage(new MainReactPackage())
-     .addPackage(new WebRTCModulePackage())        // <--- Add this line
-     .setUseDeveloperSupport(BuildConfig.DEBUG)
-```
-
-5.) Enable Java 8 support in your project. You will probably need to have React Native 0.55+ for this.
-
-5.a.) In `android/app/build.gradle` add inside `android` section:
 ```gradle
 compileOptions {
-    sourceCompatibility JavaVersion.VERSION_1_8
-    targetCompatibility JavaVersion.VERSION_1_8
+	sourceCompatibility JavaVersion.VERSION_1_8
+	targetCompatibility JavaVersion.VERSION_1_8
 }
 ```
 
-5.b.) In `android/build.gradle` replace to:
+## R8/ProGuard Support
 
-```gradle
-dependencies {
-  classpath 'com.android.tools.build:gradle:3.0.1'
-}
+In `android/app/proguard-rules.pro` add the following on a new line.
 
-//...
-
-ext {
-  //...
-  compileSdkVersion 27
-  buildToolsVersion '27.0.3'
-  //...
-}
+```proguard
+-keep class org.webrtc.** { *; }
 ```
 
-5.c.) In `android/gradle/wrapper/gradle-wrapper.properties` set `distributionUrl` variable to
+## Screen Capture Support - Android 10+
+
+You'll need [Notifee](https://notifee.app/react-native/docs/overview) or another library that can handle foreground services for you.  
+The basic requirement to get screen capturing working since Android 10 and above is to have a foreground service with `mediaProjection` included as a service type and to have that service running before starting a screen capture session.  
+
+In `android/app/main/AndroidManifest.xml` add the following inside the `<application>` section.  
+
+```xml
+<service
+	android:name="app.notifee.core.ForegroundService"
+	android:foregroundServiceType="mediaProjection|camera|microphone" />
 ```
-distributionUrl=https\://services.gradle.org/distributions/gradle-4.1-all.zip
+
+The following will create an ongoing persistent notification which also comes with a foreground service.  
+You will be prompted for permissions automatically each time you want to initialise screen capturing.  
+A notification channel is also required and created.  
+
+```javascript
+import notifee, { AndroidImportance } from '@notifee/react-native';
+
+try {
+	const channelId = await notifee.createChannel( {
+		id: 'screen_capture',
+		name: 'Screen Capture',
+		lights: false,
+		vibration: false,
+		importance: AndroidImportance.DEFAULT
+	} );
+
+	await notifee.displayNotification( {
+		title: 'Screen Capture',
+		body: 'This notification will be here until you stop capturing.',
+		android: {
+			channelId,
+			asForegroundService: true
+		}
+	} );
+} catch( err ) {
+	// Handle Error
+};
 ```
 
+Once screen capturing has finished you should then stop the foreground service.  
+Usually you'd run a notification cancellation function but as the service is involved, instead run the following.  
 
-## CLEAN PROCESS
+```javascript
+try {
+	await notifee.stopForegroundService();
+} catch( err ) {
+	// Handle Error
+};
+```
 
-if you encounter any build time errors, like "linking library not found",  
-try the cleaning steps below, and do it again carefully with every steps.
+Lastly you'll need to add this to your projects main `index.js` file.  
+Otherwise you'll receive errors relating to the foreground service not being registered correctly.  
 
-1. remove npm module: `rm -rf $YourProject/node_modules/react-native-webrtc`
-2. clean npm cache: `npm cache clean`
-3. clear temporary build files ( depends on your env )
-    * ANDROID: clear intermediate files in `gradle buildDir`
-    * iOS: in xocde project, click `Product` -> `clean`
-4. `npm install react-native-webrtc`
+```javascript
+notifee.registerForegroundService( notification => {
+	return new Promise( () => {
+
+	} );
+} );
+```
+
+## Fatal Exception: java.lang.UnsatisfiedLinkError
+
+```
+Fatal Exception: java.lang.UnsatisfiedLinkError: No implementation found for void org.webrtc.PeerConnectionFactory.nativeInitializeAndroidGlobals() (tried Java_org_webrtc_PeerConnectionFactory_nativeInitializeAndroidGlobals and Java_org_webrtc_PeerConnectionFactory_nativeInitializeAndroidGlobals__)
+	at org.webrtc.PeerConnectionFactory.nativeInitializeAndroidGlobals(PeerConnectionFactory.java)
+	at org.webrtc.PeerConnectionFactory.initialize(PeerConnectionFactory.java:306)
+	at com.oney.WebRTCModule.WebRTCModule.initAsync(WebRTCModule.java:79)
+	at com.oney.WebRTCModule.WebRTCModule.lambda$new$0(WebRTCModule.java:70)
+	at com.oney.WebRTCModule.-$$Lambda$WebRTCModule$CnyHZvkjDxq52UReGHUZlY0JsVw.run(-.java:4)
+	at java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1162)
+	at java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:636)
+	at java.lang.Thread.run(Thread.java:764)
+```
+
+If you're experiencing the error above then in `android/gradle.properties` add the following.  
+
+```
+# This one fixes a weird WebRTC runtime problem on some devices.
+# https://github.com/jitsi/jitsi-meet/issues/7911#issuecomment-714323255
+
+android.enableDexingArtifactTransform.desugaring=false
+```

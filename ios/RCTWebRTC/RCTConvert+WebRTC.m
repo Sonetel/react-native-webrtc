@@ -1,4 +1,5 @@
 #import "RCTConvert+WebRTC.h"
+#import <React/RCTLog.h>
 #import <WebRTC/RTCDataChannelConfiguration.h>
 #import <WebRTC/RTCIceServer.h>
 #import <WebRTC/RTCSessionDescription.h>
@@ -8,7 +9,6 @@
 + (RTCSessionDescription *)RTCSessionDescription:(id)json
 {
   if (!json) {
-    RCTLogConvertError(json, @"must not be null");
     return nil;
   }
 
@@ -44,9 +44,19 @@
     RCTLogConvertError(json, @".candidate must not be null");
     return nil;
   }
+  
+  if (json[@"sdpMid"] == nil) {
+    RCTLogConvertError(json, @".sdpMid must not be null");
+    return nil;
+  }
+
+  if (json[@"sdpMLineIndex"] == nil) {
+    RCTLogConvertError(json, @".sdpMLineIndex must not be null");
+    return nil;
+  }
 
   NSString *sdp = json[@"candidate"];
-  NSLog(@"%@ <- candidate", sdp);
+  RCTLogTrace(@"%@ <- candidate", sdp);
   int sdpMLineIndex = [RCTConvert int:json[@"sdpMLineIndex"]];
   NSString *sdpMid = json[@"sdpMid"];
 
@@ -67,10 +77,7 @@
   }
 
   NSArray<NSString *> *urls;
-  if ([json[@"url"] isKindOfClass:[NSString class]]) {
-    // TODO: 'url' is non-standard
-    urls = @[json[@"url"]];
-  } else if ([json[@"urls"] isKindOfClass:[NSString class]]) {
+  if ([json[@"urls"] isKindOfClass:[NSString class]]) {
     urls = @[json[@"urls"]];
   } else {
     urls = [RCTConvert NSArray:json[@"urls"]];
@@ -88,6 +95,11 @@
 + (nonnull RTCConfiguration *)RTCConfiguration:(id)json
 {
   RTCConfiguration *config = [[RTCConfiguration alloc] init];
+
+  // Required for perfect negotiation.
+  config.enableImplicitRollback = YES;
+
+  config.sdpSemantics = RTCSdpSemanticsUnifiedPlan;
 
   if (!json) {
     return config;
@@ -180,9 +192,6 @@
 
     if (json[@"ordered"]) {
       init.isOrdered = [RCTConvert BOOL:json[@"ordered"]];
-    }
-    if (json[@"maxRetransmitTime"]) {
-      init.maxRetransmitTimeMs = [RCTConvert NSInteger:json[@"maxRetransmitTime"]];
     }
     if (json[@"maxRetransmits"]) {
       init.maxRetransmits = [RCTConvert int:json[@"maxRetransmits"]];
